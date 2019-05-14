@@ -43,7 +43,7 @@ module private BinaryFormatUtils =
     [<Literal>]
     let flagMask  = 0x000000ffu
 
-    // this binary format uses Buffer.BlockCopy for performance
+    // this binary format uses Marshal.Copy for performance
     // and thus does little to handle endianness issues.
     // To avoid silent data corruption, record the serializer's
     // endianness setting at the beginning of the serialization stream.
@@ -58,25 +58,39 @@ module private BinaryFormatUtils =
         flagMask &&& header |> byte |> EnumOfValue<byte, ObjectFlags>
 
     [<Literal>]
-    let bufferSize = 256    
+    let bufferSize = 4096
     let buffer = new ThreadLocal<byte []>(fun () -> Array.zeroCreate<byte> bufferSize)
+
+    let byteLength (arr : Array) =
+        let elementType = arr.GetType().GetElementType()
+
+        // .NET limits array counts to UInt32.MaxValue
+        let mutable sourceCount = 1u;
+        for i = 0 to arr.Rank - 1 do
+            sourceCount <- sourceCount * uint32 (arr.GetLength i)
+
+        uint64 (System.Runtime.InteropServices.Marshal.SizeOf elementType) * uint64 sourceCount
 
     /// block copy primitive array to stream
     let blockCopy (source : Array, target : Stream) =
-
         let buf = buffer.Value
-        let mutable bytes = Buffer.ByteLength source
-        let mutable i = 0
+        let mutable bytes = byteLength source
 
-        while bytes > bufferSize do
-            Buffer.BlockCopy(source, i, buf, 0, bufferSize)
-            target.Write(buf, 0, bufferSize)
-            i <- i + bufferSize
-            bytes <- bytes - bufferSize
+        let arrayHandle = System.Runtime.InteropServices.GCHandle.Alloc(source,  System.Runtime.InteropServices.GCHandleType.Pinned);
+        try
+            let mutable pin = arrayHandle.AddrOfPinnedObject();
 
-        if bytes > 0 then
-            Buffer.BlockCopy(source, i, buf, 0, bytes)
-            target.Write(buf, 0, bytes)
+            while bytes > uint64 bufferSize do
+                System.Runtime.InteropServices.Marshal.Copy(pin, buf, 0, bufferSize)
+                target.Write(buf, 0, bufferSize)
+                pin <- IntPtr.Add(pin, bufferSize)
+                bytes <- bytes - uint64 bufferSize
+
+            if bytes > 0UL then
+                System.Runtime.InteropServices.Marshal.Copy(pin, buf, 0, int bytes)
+                target.Write(buf, 0, int bytes)
+        finally
+            arrayHandle.Free()
 
     /// copy stream contents to preallocated array
     let blockRead (source : Stream, target : Array) =
@@ -86,18 +100,23 @@ module private BinaryFormatUtils =
             while read < n do
                 read <- read + source.Read(buf, read, n - read)
         
-        let mutable bytes = Buffer.ByteLength target
-        let mutable i = 0
+        let mutable bytes = byteLength target
 
-        while bytes > bufferSize do
-            do fillBytes bufferSize
-            Buffer.BlockCopy(buf, 0, target, i, bufferSize)
-            i <- i + bufferSize
-            bytes <- bytes - bufferSize
+        let arrayHandle = System.Runtime.InteropServices.GCHandle.Alloc(target,  System.Runtime.InteropServices.GCHandleType.Pinned);
+        try
+            let mutable pin = arrayHandle.AddrOfPinnedObject();
 
-        if bytes > 0 then
-            do fillBytes bytes
-            Buffer.BlockCopy(buf, 0, target, i, bytes)
+            while bytes > uint64 bufferSize do
+                do fillBytes bufferSize
+                System.Runtime.InteropServices.Marshal.Copy(buf, 0, pin, bufferSize)
+                pin <- IntPtr.Add(pin, bufferSize)
+                bytes <- bytes - uint64 bufferSize
+
+            if bytes > 0UL then
+                do fillBytes (int bytes)
+                System.Runtime.InteropServices.Marshal.Copy(buf, 0, pin, int bytes)
+        finally
+            arrayHandle.Free()
   
 // force little endian : by default, the writer uses Buffer.BlockCopy when serializing arrays.
 // this is performant, but it does not respect endianness.
